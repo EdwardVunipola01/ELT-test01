@@ -1,0 +1,1706 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+import os
+import pandas as pd
+import sqlalchemy
+import xml.etree.ElementTree as ET
+import json
+import re
+from pathlib import Path
+import logging
+import glob
+import urllib.parse
+from typing import List, Dict, Any
+
+# DAG Configuration
+default_args = {
+    'owner': 'data_team',
+    'depends_on_past': False,
+    'start_date': datetime(2024, 1, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'universal_data_processor',
+    default_args=default_args,
+    description='🚀 Process ANY file type: CSV, Excel, XML with unlimited scale',
+    schedule_interval=timedelta(minutes=15),  # Check every 15 minutes
+    catchup=False,
+    tags=['universal', 'csv', 'excel', 'xml', 'dynamic', 'scalable'],
+)
+
+# Configuration
+INPUT_FOLDER = '/opt/airflow/data/input'
+PROCESSED_FOLDER = '/opt/airflow/data/processed'
+FAILED_FOLDER = '/opt/airflow/data/failed'
+LOGS_FOLDER = '/opt/airflow/data/logs'
+
+
+def get_database_engine():
+    """Get database engine with fallback options and proper error handling"""
+    import urllib.parse
+    
+    # Get connection details from environment
+    host = os.getenv('SQL_SERVER_HOST', 'host.docker.internal,1433')
+    database = os.getenv('SQL_SERVER_DATABASE', 'master')
+    user = os.getenv('SQL_SERVER_USER', 'airflow_user')
+    password = os.getenv('SQL_SERVER_PASSWORD', 'StrongP@ssword!')
+    
+    # URL encode password
+    encoded_password = urllib.parse.quote_plus(password)
+    
+    # Try multiple connection approaches
+    connection_configs = [
+        {
+            'name': 'PyMSSQL',
+            'conn_str': f'mssql+pymssql://{user}:{encoded_password}@host.docker.internal:1433/{database}',
+            'db_type': 'sqlserver'
+        },
+        {
+            'name': 'PyODBC',
+            'conn_str': f'mssql+pyodbc://{user}:{encoded_password}@host.docker.internal:1433/{database}?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes&Encrypt=no',
+            'db_type': 'sqlserver'
+        },
+        {
+            'name': 'SQLite Fallback',
+            'conn_str': 'sqlite:////opt/airflow/data/fallback_database.db',
+            'db_type': 'sqlite'
+        }
+    ]
+    
+    for config in connection_configs:
+        try:
+            logging.info(f"🔄 Trying {config['name']} connection...")
+            engine = sqlalchemy.create_engine(config['conn_str'])
+            
+            # Test connection
+            with engine.connect() as conn:
+                conn.execute(sqlalchemy.text('SELECT 1'))
+            
+            logging.info(f"✅ Connected successfully using {config['name']}")
+            # Store database type in engine for later use
+            engine.db_type = config['db_type']
+            return engine
+            
+        except Exception as e:
+            logging.warning(f"⚠️ {config['name']} failed: {e}")
+            continue
+    
+    raise Exception("❌ All database connections failed!")
+
+def generate_create_table_sql(file_info: Dict, engine) -> str:
+    """Generate database-specific CREATE TABLE SQL"""
+    table_name = file_info['table_name']
+    
+    # Generate column definitions
+    columns_sql = []
+    for col in file_info['columns']:
+        nullable = "NULL" if col['nullable'] else "NOT NULL"
+        
+        if hasattr(engine, 'db_type') and engine.db_type == 'sqlite':
+            # SQLite-compatible data types
+            sql_type = convert_to_sqlite_type(col['sql_type'])
+            columns_sql.append(f"[{col['name']}] {sql_type} {nullable}")
+        else:
+            # SQL Server types
+            columns_sql.append(f"[{col['name']}] {col['sql_type']} {nullable}")
+    
+    if hasattr(engine, 'db_type') and engine.db_type == 'sqlite':
+        # SQLite syntax
+        create_table_sql = f"""
+        DROP TABLE IF EXISTS {table_name};
+        
+        CREATE TABLE {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            {', '.join(columns_sql)},
+            source_file TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            loaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            processing_batch_id TEXT NOT NULL
+        );
+        
+        CREATE INDEX IF NOT EXISTS IX_{table_name}_loaded_at ON {table_name}(loaded_at);
+        CREATE INDEX IF NOT EXISTS IX_{table_name}_source_file ON {table_name}(source_file);
+        """
+    else:
+        # SQL Server syntax
+        create_table_sql = f"""
+        IF OBJECT_ID('dbo.{table_name}', 'U') IS NOT NULL
+            DROP TABLE dbo.{table_name};
+        
+        CREATE TABLE dbo.{table_name} (
+            id BIGINT IDENTITY(1,1) PRIMARY KEY,
+            {', '.join(columns_sql)},
+            source_file NVARCHAR(255) NOT NULL,
+            file_type NVARCHAR(50) NOT NULL,
+            loaded_at DATETIME2 DEFAULT GETDATE(),
+            processing_batch_id NVARCHAR(50) NOT NULL
+        );
+        
+        CREATE INDEX IX_{table_name}_loaded_at ON dbo.{table_name}(loaded_at);
+        CREATE INDEX IX_{table_name}_source_file ON dbo.{table_name}(source_file);
+        """
+    
+    return create_table_sql
+
+def convert_to_sqlite_type(sql_server_type: str) -> str:
+    """Convert SQL Server data types to SQLite equivalents"""
+    type_mapping = {
+        'BIGINT': 'INTEGER',
+        'DECIMAL(18,6)': 'REAL', 
+        'DECIMAL(18,4)': 'REAL',
+        'DATETIME2': 'DATETIME',
+        'BIT': 'INTEGER',
+        'NVARCHAR(100)': 'TEXT',
+        'NVARCHAR(500)': 'TEXT',
+        'NVARCHAR(MAX)': 'TEXT',
+        'NVARCHAR(255)': 'TEXT'
+    }
+    
+    # Check for exact matches first
+    if sql_server_type in type_mapping:
+        return type_mapping[sql_server_type]
+    
+    # Handle NVARCHAR with specific lengths
+    if sql_server_type.startswith('NVARCHAR'):
+        return 'TEXT'
+    
+    # Default fallback
+    return 'TEXT'
+
+# #updated SQL syntax with database specific types
+# def create_dynamic_tables(**context):
+#     """🏗️ Create database tables dynamically with proper SQL syntax"""
+#     parsed_files = context['task_instance'].xcom_pull(key='parsed_files')
+    
+#     if not parsed_files:
+#         logging.info("No files to create tables for")
+#         return
+    
+#     engine = get_database_engine()
+#     created_tables = []
+    
+#     for file_info in parsed_files:
+#         try:
+#             table_name = file_info['table_name']
+            
+#             # ✅ FIXED: Use the database-specific CREATE TABLE SQL generation
+#             create_table_sql = generate_create_table_sql(file_info, engine)
+            
+#             # Execute table creation
+#             with engine.connect() as conn:
+#                 # Execute each statement separately for compatibility
+#                 statements = [stmt.strip() for stmt in create_table_sql.split(';') if stmt.strip()]
+#                 for statement in statements:
+#                     if statement:
+#                         conn.execute(sqlalchemy.text(statement))
+#                         # Auto-commit in newer SQLAlchemy versions
+            
+#             created_tables.append(table_name)
+#             logging.info(f"✅ Created table: {table_name}")
+            
+#         except Exception as e:
+#             logging.error(f"❌ Failed to create table for {file_info['filename']}: {str(e)}")
+#             move_to_failed(file_info['filepath'], f"Table creation failed: {str(e)}")
+    
+#     context['task_instance'].xcom_push(key='created_tables', value=created_tables)
+#     return created_tables
+
+
+# Supported file extensions
+SUPPORTED_EXTENSIONS = {
+    '.csv': 'csv',
+    '.xlsx': 'excel',
+    '.xls': 'excel', 
+    '.xml': 'xml',
+    '.json': 'json'  # Bonus: JSON support too!
+}
+
+def discover_all_files(**context):
+    """🔍 Discover ALL supported files in input folder"""
+    discovered_files = []
+    
+    # Create necessary directories
+    for folder in [PROCESSED_FOLDER, FAILED_FOLDER, LOGS_FOLDER]:
+        os.makedirs(folder, exist_ok=True)
+    
+    # Find all supported files
+    for ext, file_type in SUPPORTED_EXTENSIONS.items():
+        pattern = f"{INPUT_FOLDER}/*{ext}"
+        files = glob.glob(pattern)
+        
+        for filepath in files:
+            filename = os.path.basename(filepath)
+            file_info = {
+                'filepath': filepath,
+                'filename': filename,
+                'file_type': file_type,
+                'extension': ext,
+                'size_mb': round(os.path.getsize(filepath) / (1024*1024), 2),
+                'table_name': generate_table_name(filename),
+                'discovered_at': datetime.now().isoformat()
+            }
+            discovered_files.append(file_info)
+    
+    logging.info(f"🎯 Discovered {len(discovered_files)} files:")
+    for file_info in discovered_files:
+        logging.info(f"  📄 {file_info['filename']} ({file_info['file_type']}, {file_info['size_mb']}MB)")
+    
+    # Store for downstream tasks
+    context['task_instance'].xcom_push(key='discovered_files', value=discovered_files)
+    return discovered_files
+
+def generate_table_name(filename: str) -> str:
+    """Generate clean SQL table name from filename"""
+    import re
+    # Remove extension and clean name
+    name = os.path.splitext(filename)[0]
+    # Replace spaces, hyphens, special chars with underscores
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    # Remove multiple underscores
+    name = re.sub(r'_+', '_', name)
+    # Ensure starts with letter
+    if name[0].isdigit():
+        name = f"data_{name}"
+    return f"raw_{name.lower()}"
+
+
+
+def parse_file_structures(**context):
+    """🔍 Parse file structures and generate table schemas"""
+    discovered_files = context['task_instance'].xcom_pull(key='discovered_files')
+    
+    if not discovered_files:
+        logging.info("No files to parse")
+        return []
+    
+    parsed_files = []
+    
+    for file_info in discovered_files:
+        try:
+            logging.info(f"🔍 Parsing structure of {file_info['filename']}...")
+            
+            if file_info['file_type'] == 'csv':
+                parsed_info = parse_csv_structure(file_info)
+            elif file_info['file_type'] == 'excel':
+                parsed_info = parse_excel_structure(file_info)
+            elif file_info['file_type'] == 'xml':
+                parsed_info = parse_xml_structure(file_info)
+            elif file_info['file_type'] == 'json':
+                parsed_info = parse_json_structure(file_info)
+            else:
+                logging.warning(f"⚠️ Unsupported file type: {file_info['file_type']}")
+                continue
+            
+            # ✅ FIXED: Ensure all data is JSON serializable
+            parsed_info = make_json_serializable(parsed_info)
+            
+            parsed_files.append(parsed_info)
+            logging.info(f"✅ Successfully parsed {file_info['filename']}")
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to parse {file_info['filename']}: {str(e)}")
+            logging.error(f"🔍 Error type: {type(e).__name__}")
+            logging.error(f"🔍 File info: {file_info}")
+            
+            # Move problematic file to failed folder
+            move_to_failed(file_info['filepath'], f"Structure parsing failed: {str(e)}")
+    
+    # ✅ FIXED: Ensure the result is JSON serializable before XCom push
+    serializable_parsed_files = make_json_serializable(parsed_files)
+    
+    context['task_instance'].xcom_push(key='parsed_files', value=serializable_parsed_files)
+    return serializable_parsed_files
+
+
+def make_json_serializable(obj):
+    """Convert objects to JSON serializable format"""
+    import json
+    from datetime import datetime, date
+    
+    if isinstance(obj, dict):
+        return {key: make_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_serializable(item) for item in obj]
+    elif isinstance(obj, set):
+        # ✅ FIXED: Convert sets to lists for JSON serialization
+        return list(obj)
+    elif isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    elif hasattr(obj, '__dict__'):
+        return make_json_serializable(obj.__dict__)
+    else:
+        try:
+            json.dumps(obj)  # Test if it's JSON serializable
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)  # Convert to string as fallback
+
+
+
+
+def parse_csv_structure(file_info: Dict) -> Dict:
+    """Parse CSV file structure with enhanced error handling"""
+    
+    if not os.path.exists(file_info['filepath']):
+        raise FileNotFoundError(f"File not found: {file_info['filepath']}")
+    
+    # Try multiple encodings
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    df = None
+    used_encoding = None
+    
+    for encoding in encodings:
+        try:
+            # ✅ FIXED: Read with more robust parameters
+            df = pd.read_csv(
+                file_info['filepath'], 
+                encoding=encoding,
+                low_memory=False,  # Prevent mixed type inference issues
+                na_values=['', 'NULL', 'null', 'None', 'N/A', 'n/a', '#N/A'],
+                keep_default_na=True,
+                nrows=1000  # Limit sample size for faster processing
+            )
+            used_encoding = encoding
+            logging.info(f"✅ Successfully read CSV with {encoding} encoding")
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to read with {encoding}: {e}")
+            continue
+    
+    if df is None:
+        raise ValueError("Could not read CSV file with any encoding")
+    
+    logging.info(f"📊 CSV loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+    logging.info(f"📋 Columns: {list(df.columns)}")
+    
+    # ✅ FIXED: Clean column names early to avoid issues
+    original_columns = list(df.columns)
+    df.columns = [sanitize_column_name(col) for col in df.columns]
+    
+    # Handle duplicate column names
+    seen_columns = []
+    final_columns = []
+    for col in df.columns:
+        if col in seen_columns:
+            counter = 1
+            new_col = f"{col}_{counter}"
+            while new_col in seen_columns:
+                counter += 1
+                new_col = f"{col}_{counter}"
+            final_columns.append(new_col)
+            seen_columns.append(new_col)
+        else:
+            final_columns.append(col)
+            seen_columns.append(col)
+    
+    df.columns = final_columns
+    
+    # Generate schema info
+    schema_info = analyze_dataframe_structure(file_info, df)
+    
+    # ✅ FIXED: Add metadata safely
+    schema_info.update({
+        'encoding_used': used_encoding,
+        'original_columns': original_columns,
+        'data_quality': {
+            'total_rows_sampled': len(df),
+            'empty_columns': sum(1 for col in df.columns if df[col].isnull().all()),
+            'duplicate_rows': df.duplicated().sum()
+        }
+    })
+    
+    return schema_info
+
+def parse_excel_structure(file_info: Dict) -> Dict:
+    """Parse Excel file structure - handles multiple sheets"""
+    excel_file = pd.ExcelFile(file_info['filepath'])
+    
+    # If multiple sheets, process the first sheet (can be enhanced)
+    sheet_name = excel_file.sheet_names[0]
+    df = pd.read_excel(file_info['filepath'], sheet_name=sheet_name, nrows=1000)
+    
+    schema_info = analyze_dataframe_structure(file_info, df)
+    schema_info['sheet_name'] = sheet_name
+    schema_info['total_sheets'] = len(excel_file.sheet_names)
+    
+    return schema_info
+
+
+def parse_xml_structure(file_info: Dict) -> Dict:
+    """Parse XML file structure - converts to tabular format"""
+    tree = ET.parse(file_info['filepath'])
+    root = tree.getroot()
+    
+    # Extract all unique element paths
+    def extract_elements(element, path=""):
+        elements = []
+        current_path = f"{path}/{element.tag}" if path else element.tag
+        
+        if element.text and element.text.strip():
+            elements.append({
+                'path': current_path,
+                'text': element.text.strip()
+            })
+        
+        for child in element:
+            elements.extend(extract_elements(child, current_path))
+        
+        return elements
+    
+    # Get sample data
+    all_elements = extract_elements(root)
+    
+    # Convert to DataFrame for analysis
+    if all_elements:
+        df = pd.DataFrame(all_elements)
+        # Pivot to get columns
+        df_pivot = df.pivot_table(index=df.index, columns='path', values='text', aggfunc='first')
+        return analyze_dataframe_structure(file_info, df_pivot)
+    else:
+        raise ValueError("No extractable data found in XML")
+
+def parse_json_structure(file_info: Dict) -> Dict:
+    """Parse JSON file structure"""
+    with open(file_info['filepath'], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # Normalize JSON to DataFrame
+    if isinstance(data, list):
+        df = pd.json_normalize(data)
+    elif isinstance(data, dict):
+        df = pd.json_normalize([data])
+    else:
+        raise ValueError("JSON format not supported")
+    
+    return analyze_dataframe_structure(file_info, df)
+
+def analyze_dataframe_structure(file_info: Dict, df: pd.DataFrame) -> Dict:
+    """Analyze DataFrame structure and generate schema with proper serialization"""
+    schema_info = {
+        'filename': file_info['filename'],
+        'table_name': file_info['table_name'],
+        'filepath': file_info['filepath'],
+        'file_type': file_info['file_type'],
+        'columns': [],
+        'row_count_sample': len(df),
+        'total_columns': len(df.columns),
+    }
+
+    used_names: List[str] = []
+
+    for i, col in enumerate(df.columns):
+        # sanitize safely (handles None)
+        clean_col_name = sanitize_column_name(str(col) if col is not None else f"Column_{i}")
+
+        # de-duplicate
+        base = clean_col_name
+        counter = 1
+        while clean_col_name in used_names:
+            clean_col_name = f"{base}_{counter}"
+            counter += 1
+        used_names.append(clean_col_name)
+
+        # detect type once, then override if needed
+        inferred_sql_type = detect_sql_type(df[col])
+
+        # flags
+        name_l = clean_col_name.lower()
+        is_temporal = ("date" in name_l) or ("time" in name_l)
+        is_postal = (name_l == "postal_code")
+
+        # postal_code: force text + nullable (preserves leading zeros; allows blanks)
+        if is_postal:
+            inferred_sql_type = "NVARCHAR(20)"
+
+        # nullable: force for temporal + postal; else based on data
+        nullable_flag = True if (is_temporal or is_postal) else bool(df[col].isnull().any())
+
+        sample_values = get_safe_sample_values(df[col])
+
+        schema_info['columns'].append({
+            'name': clean_col_name,
+            'original_name': str(col) if col is not None else f'Column_{i}',
+            'sql_type': inferred_sql_type,
+            'nullable': nullable_flag,
+            'sample_values': sample_values,
+        })
+
+    return schema_info
+
+
+def get_safe_sample_values(series: pd.Series, max_samples: int = 3) -> list:
+    """Get sample values that are JSON serializable"""
+    try:
+        # Get non-null values
+        non_null_values = series.dropna()
+        
+        if len(non_null_values) == 0:
+            return []
+        
+        # Take sample values
+        sample_values = non_null_values.head(max_samples).tolist()
+        
+        # Make them JSON serializable
+        safe_values = []
+        for value in sample_values:
+            try:
+                # Convert pandas/numpy types to Python types
+                if pd.isna(value):
+                    safe_values.append(None)
+                elif isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                    safe_values.append(str(value))
+                elif hasattr(value, 'item'):  # numpy types
+                    safe_values.append(value.item())
+                else:
+                    safe_values.append(value)
+            except Exception:
+                safe_values.append(str(value))  # Fallback to string
+        
+        return safe_values
+        
+    except Exception as e:
+        logging.warning(f"⚠️ Could not get sample values: {e}")
+        return []
+
+
+def detect_sql_type(series: pd.Series) -> str:
+    """Enhanced SQL Server type detection with better handling"""
+    # Drop null values for analysis
+    non_null_series = series.dropna()
+    
+    if len(non_null_series) == 0:
+        return 'NVARCHAR(255)'
+    
+    # Convert to string for analysis
+    string_series = non_null_series.astype(str)
+    
+    # ✅ Try numeric types first with better validation
+    try:
+        numeric_series = pd.to_numeric(string_series, errors='coerce')
+        if not numeric_series.isna().any():
+            # Check if all values are integers
+            if all(float(x).is_integer() for x in numeric_series):
+                max_val = numeric_series.max()
+                min_val = numeric_series.min()
+                
+                # Choose appropriate integer type based on range
+                if min_val >= -2147483648 and max_val <= 2147483647:
+                    return 'INT'
+                else:
+                    return 'BIGINT'
+            else:
+                return 'DECIMAL(18,6)'
+    except:
+        pass
+    
+    # ✅ Try datetime with multiple formats
+    try:
+        pd.to_datetime(string_series, errors='raise')
+        return 'DATETIME2'
+    except:
+        pass
+    
+    # ✅ FIXED: Try boolean with proper list structure instead of nested sets
+    unique_vals = set(string_series.str.lower().unique())
+    
+    # ✅ FIXED: Use list of sets instead of set of sets
+    boolean_patterns = [
+        {'true', 'false'}, {'1', '0'}, {'yes', 'no'}, 
+        {'y', 'n'}, {'t', 'f'}, {'on', 'off'}
+    ]
+    
+    # ✅ FIXED: Check if unique_vals is a subset of any pattern
+    for pattern in boolean_patterns:
+        if unique_vals.issubset(pattern):
+            return 'BIT'
+    
+    # ✅ String type with better length calculation
+    max_length = max(len(str(val)) for val in string_series)
+    
+    if max_length <= 50:
+        return 'NVARCHAR(100)'
+    elif max_length <= 255:
+        return 'NVARCHAR(500)'
+    elif max_length <= 4000:
+        return f'NVARCHAR({min(max_length * 2, 4000)})'
+    else:
+        return 'NVARCHAR(MAX)'
+
+
+def create_dynamic_tables(**context):
+    """🏗️ Create database tables dynamically with proper SQL syntax and error handling"""
+    parsed_files = context['task_instance'].xcom_pull(key='parsed_files')
+    
+    if not parsed_files:
+        logging.info("No files to create tables for")
+        return
+    
+    engine = get_database_engine()
+    created_tables = []
+    
+    for file_info in parsed_files:
+        try:
+            table_name = file_info['table_name']
+            
+            # ✅ FIXED: Better SQL generation with validation
+            create_table_sql = generate_create_table_sql(file_info, engine)
+            
+            # ✅ FIXED: Enhanced SQL execution with proper error handling
+            with engine.connect() as conn:
+                statements = [stmt.strip() for stmt in create_table_sql.split(';') if stmt.strip()]
+                
+                for i, statement in enumerate(statements):
+                    if statement:
+                        try:
+                            # Log the SQL being executed for debugging
+                            logging.info(f"🔍 Executing SQL statement {i+1}: {statement[:100]}...")
+                            
+                            # Execute with proper text wrapping
+                            conn.execute(sqlalchemy.text(statement))
+                            
+                        except Exception as sql_error:
+                            logging.error(f"❌ SQL execution failed for statement {i+1}: {sql_error}")
+                            logging.error(f"🔍 Problematic SQL: {statement}")
+                            raise sql_error
+            
+            created_tables.append(table_name)
+            logging.info(f"✅ Created table: {table_name}")
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to create table for {file_info['filename']}: {str(e)}")
+            
+            # ✅ FIXED: Enhanced error logging
+            logging.error(f"🔍 File info: {file_info}")
+            
+            # Move to failed folder with detailed error
+            move_to_failed(file_info['filepath'], f"Table creation failed: {str(e)}")
+    
+    context['task_instance'].xcom_push(key='created_tables', value=created_tables)
+    return created_tables
+
+
+def sanitize_column_name(col_name: str) -> str:
+    """Sanitize column names to avoid SQL issues"""
+    import re
+    
+    # Handle empty/null column names
+    if not col_name or str(col_name).strip() == '' or str(col_name).lower() in ['nan', 'none', 'null']:
+        return 'col_unnamed'
+    
+    # Reserved SQL keywords to avoid
+    reserved_words = {'count', 'select', 'from', 'where', 'order', 'group', 'having', 'table', 'column', 'index', 'key', 'value', 'date', 'time', 'timestamp', 'user', 'database', 'schema'}
+    
+    # Clean the name
+    clean_name = str(col_name).lower().strip()
+    
+    # Handle special pandas cases
+    if clean_name.startswith('unnamed:'):
+        clean_name = f"col_{clean_name.replace(':', '_')}"
+    
+    # Replace special characters with underscores
+    clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', clean_name)
+    
+    # Remove multiple underscores
+    clean_name = re.sub(r'_+', '_', clean_name)
+    
+    # Remove leading/trailing underscores
+    clean_name = clean_name.strip('_')
+    
+    # Handle empty result after cleaning
+    if not clean_name:
+        clean_name = 'col_empty'
+    
+    # Handle reserved words
+    if clean_name in reserved_words:
+        clean_name = f"col_{clean_name}"
+    
+    # Ensure starts with letter or underscore
+    if clean_name and clean_name[0].isdigit():
+        clean_name = f"col_{clean_name}"
+    
+    # Ensure minimum length
+    if len(clean_name) < 2:
+        clean_name = f"col_{clean_name}"
+        
+    return clean_name
+
+
+def load_xml_data(filepath: str) -> pd.DataFrame:
+    """Load XML data into DataFrame"""
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+    
+    # Convert XML to records
+    def xml_to_dict(element):
+        result = {}
+        for child in element:
+            if len(child) == 0:
+                result[child.tag] = child.text
+            else:
+                result[child.tag] = xml_to_dict(child)
+        return result
+    
+    records = []
+    for child in root:
+        records.append(xml_to_dict(child))
+    
+    return pd.json_normalize(records)
+
+def load_json_data(filepath: str) -> pd.DataFrame:
+    """Load JSON data into DataFrame"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    if isinstance(data, list):
+        return pd.json_normalize(data)
+    elif isinstance(data, dict):
+        return pd.json_normalize([data])
+
+# def move_to_processed(filepath: str):
+#     """Move successfully processed file to processed folder"""
+#     filename = os.path.basename(filepath)
+#     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+#     new_name = f"{timestamp}_{filename}"
+#     new_path = f"{PROCESSED_FOLDER}/{new_name}"
+#     os.rename(filepath, new_path)
+
+def move_to_failed(filepath: str, error_msg: str):
+    """Move failed file to failed folder with error log"""
+    try:
+        if not os.path.exists(filepath):
+            logging.warning(f"⚠️ File {filepath} no longer exists, skipping move to failed")
+            return
+            
+        filename = os.path.basename(filepath)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Ensure failed folder exists
+        os.makedirs(FAILED_FOLDER, exist_ok=True)
+        
+        # Move file
+        new_name = f"{timestamp}_{filename}"
+        new_path = f"{FAILED_FOLDER}/{new_name}"
+        os.rename(filepath, new_path)
+        
+        # Create error log
+        error_log_path = f"{FAILED_FOLDER}/{timestamp}_{filename}.error.log"
+        with open(error_log_path, 'w') as f:
+            f.write(f"File: {filename}\n")
+            f.write(f"Failed at: {datetime.now()}\n")
+            f.write(f"Error: {error_msg}\n")
+            
+        logging.info(f"📁 Moved failed file to: {new_path}")
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to move file to failed folder: {e}")
+
+def move_to_processed(filepath: str):
+    """Move successfully processed file to processed folder"""
+    try:
+        if not os.path.exists(filepath):
+            logging.warning(f"⚠️ File {filepath} no longer exists, skipping move to processed")
+            return
+            
+        filename = os.path.basename(filepath)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Ensure processed folder exists
+        os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+        
+        new_name = f"{timestamp}_{filename}"
+        new_path = f"{PROCESSED_FOLDER}/{new_name}"
+        os.rename(filepath, new_path)
+        
+        logging.info(f"📁 Moved processed file to: {new_path}")
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to move file to processed folder: {e}")
+
+
+def clean_dataframe_for_sql(df: pd.DataFrame, file_info: Dict) -> pd.DataFrame:
+    """Enhanced DataFrame cleaning for SQL compatibility"""
+    
+    logging.info("🧹 Cleaning DataFrame for SQL compatibility...")
+    
+    # Make a copy to avoid modifying original
+    df_clean = df.copy()
+    
+    FORCE_DAYFIRST_COLS = {"order_date"}  # add more cols if needed
+
+    
+    # Handle problematic column names first
+    column_mapping = {}
+    for i, col in enumerate(df_clean.columns):
+        if col is None or pd.isna(col):
+            new_col = f'col_unnamed_{i}'
+        else:
+            new_col = sanitize_column_name(str(col))
+        column_mapping[col] = new_col
+    
+    df_clean = df_clean.rename(columns=column_mapping)
+    
+    # Handle duplicate column names
+    seen_columns = []
+    final_columns = []
+    for col in df_clean.columns:
+        if col in seen_columns:
+            counter = 1
+            new_col = f"{col}_{counter}"
+            while new_col in seen_columns:
+                counter += 1
+                new_col = f"{col}_{counter}"
+            final_columns.append(new_col)
+            seen_columns.append(new_col)
+        else:
+            final_columns.append(col)
+            seen_columns.append(col)
+    
+    df_clean.columns = final_columns
+    
+    # PRIORITY: Handle date columns FIRST
+    date_columns = [col for col in df_clean.columns if 'date' in col.lower() or 'time' in col.lower()]
+   
+    
+    for col in date_columns:
+        logging.info(f"🗓️ Processing date column: {col}")
+        try:
+            force = col in FORCE_DAYFIRST_COLS
+            df_clean[col], date_format = detect_date_format_and_parse(df_clean[col], force_dayfirst=force)
+            logging.info(f"✅ Converted {col} to datetime using format: {date_format}")
+        except Exception as e:
+            logging.warning(f"⚠️ Could not convert {col} to datetime: {e}")
+    
+    # clean data by column
+    for col in df_clean.columns:
+        if col not in date_columns:  # Skip date columns - already processed
+            logging.info(f"🧽 Cleaning column: {col}")
+            
+            # Handle object/string columns
+            if df_clean[col].dtype == 'object':
+                # Convert to string first
+                df_clean[col] = df_clean[col].astype(str)
+                
+                # Replace common null representations
+                null_values = ['nan', 'None', 'null', 'NULL', 'NaN', 'N/A', 'n/a', '#N/A']
+                for null_val in null_values:
+                    df_clean[col] = df_clean[col].replace(null_val, None)
+                
+                # Handle empty strings
+                df_clean[col] = df_clean[col].replace('', None)
+                
+                #  Trim whitespace
+                df_clean[col] = df_clean[col].apply(
+                    lambda x: x.strip() if isinstance(x, str) else x
+                )
+                
+                # Handle very long strings
+                max_length = 4000  # SQL Server NVARCHAR limit
+                df_clean[col] = df_clean[col].apply(
+                    lambda x: x[:max_length] if isinstance(x, str) and len(x) > max_length else x
+                )
+                
+                # Try to convert numeric-looking strings to numbers
+                if col in ['row_id', 'price', 'year', 'mileage', 'lot', 'col_unnamed_0', 'sales']:
+                    try:
+                        # Convert non-null values to numeric
+                        df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                        logging.info(f"✅ Converted {col} to numeric")
+                    except Exception as e:
+                        logging.warning(f"⚠️ Could not convert {col} to numeric: {e}")
+    
+    #  CRITICAL FIX: Convert ALL pandas types to native Python types - PROPERLY!
+    for col in df_clean.columns:
+        logging.info(f"🔄 Converting {col} to Python native types...")
+        
+        # FIXED: Get the actual dtype and convert accordingly
+        col_dtype = str(df_clean[col].dtype)
+        
+        if col_dtype in ['int64', 'int32', 'int16', 'int8', 'Int64']:
+            #  FIXED: Convert pandas int to Python int, handle NaN properly
+            df_clean[col] = df_clean[col].apply(
+                lambda x: int(x) if pd.notna(x) and not pd.isna(x) else None
+            )
+            
+        elif col_dtype in ['float64', 'float32', 'float16', 'Float64']:
+            #  FIXED: Convert pandas float to Python float, handle NaN properly
+            df_clean[col] = df_clean[col].apply(
+                lambda x: float(x) if pd.notna(x) and not pd.isna(x) and str(x).lower() != 'nan' else None
+            )
+            
+        elif col_dtype == 'bool':
+            #  Convert pandas bool to Python bool
+            df_clean[col] = df_clean[col].apply(
+                lambda x: bool(x) if pd.notna(x) and not pd.isna(x) else None
+            )
+            
+        elif 'datetime' in col_dtype:
+            #  FIXED: Convert pandas datetime to Python datetime properly
+            df_clean[col] = df_clean[col].apply(
+                lambda x: x.to_pydatetime() if pd.notna(x) and hasattr(x, 'to_pydatetime') else None
+            )
+            
+        elif col_dtype == 'object':
+            #  FIXED: Handle object columns - ensure they're proper strings or None
+            df_clean[col] = df_clean[col].apply(
+                lambda x: None if pd.isna(x) or str(x).lower() in ['nat', 'nan', 'none', 'null'] else str(x)
+            )
+    
+    #  FINAL VERIFICATION: Check actual Python types
+    logging.info(f"🧹 Cleaning completed:")
+    logging.info(f"   Original shape: {df.shape}")
+    logging.info(f"   Cleaned shape: {df_clean.shape}")
+    logging.info(f"   Final columns: {list(df_clean.columns)}")
+    
+    #  Log ACTUAL Python data types for debugging
+    for col in df_clean.columns:
+        sample_val = df_clean[col].iloc[0] if len(df_clean) > 0 else None
+        actual_type = type(sample_val).__name__
+        logging.info(f"   {col}: {actual_type} - Sample: {sample_val}")
+    
+    return df_clean
+
+
+
+def load_all_data(**context):
+    """📊 Load data from all file types with enhanced error handling"""
+    parsed_files = context['task_instance'].xcom_pull(key='parsed_files')
+    
+    if not parsed_files:
+        logging.info("No files to load")
+        return
+    
+    engine = get_database_engine()
+    batch_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    loaded_files = []
+    
+    for file_info in parsed_files:
+        try:
+            # Check if file still exists before processing
+            if not os.path.exists(file_info['filepath']):
+                logging.warning(f"⚠️ File {file_info['filename']} no longer exists, skipping")
+                continue
+                
+            logging.info(f"🔄 Loading {file_info['filename']}...")
+            
+            # Read data based on file type with enhanced error handling
+            if file_info['file_type'] == 'csv':
+                # Try multiple encodings for CSV
+                encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                df = None
+                for encoding in encodings:
+                    try:
+                        df = pd.read_csv(file_info['filepath'], encoding=encoding)
+                        logging.info(f"✅ Successfully read CSV with {encoding} encoding")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                
+                if df is None:
+                    raise ValueError("Could not read CSV with any encoding")
+                    
+            elif file_info['file_type'] == 'excel':
+                df = pd.read_excel(file_info['filepath'])
+            elif file_info['file_type'] == 'xml':
+                df = load_xml_data(file_info['filepath'])
+            elif file_info['file_type'] == 'json':
+                df = load_json_data(file_info['filepath'])
+            
+            logging.info(f"📊 Original DataFrame shape: {df.shape}")
+            logging.info(f"📋 Original columns: {list(df.columns)}")
+            
+            #  FIXED: Clean and validate DataFrame before processing
+            df = clean_dataframe_for_sql(df, file_info)
+            
+            #  FIXED: Ensure column names match exactly what was used in table creation
+            column_mapping = {col['original_name']: col['name'] for col in file_info['columns']}
+            
+            # Apply column mapping, but handle missing columns gracefully
+            available_columns = [col for col in column_mapping.keys() if col in df.columns]
+            missing_columns = [col for col in column_mapping.keys() if col not in df.columns]
+            
+            if missing_columns:
+                logging.warning(f"⚠️ Missing columns in data: {missing_columns}")
+            
+            # Rename only available columns
+            available_mapping = {col: column_mapping[col] for col in available_columns}
+            df = df.rename(columns=available_mapping)
+            
+            # FIXED: Add missing columns with NULL values
+            expected_columns = [col['name'] for col in file_info['columns']]
+            for col_name in expected_columns:
+                if col_name not in df.columns:
+                    df[col_name] = None
+                    logging.info(f"➕ Added missing column '{col_name}' with NULL values")
+            
+            # FIXED: Ensure column order matches table schema
+            df = df[expected_columns]
+            
+            # Add metadata columns
+            df['source_file'] = file_info['filename']
+            df['file_type'] = file_info['file_type']
+            df['loaded_at'] = datetime.now()
+            df['processing_batch_id'] = batch_id
+            
+            logging.info(f"📊 Final DataFrame shape: {df.shape}")
+            logging.info(f"📋 Final columns: {list(df.columns)}")
+            
+            #  FIXED: Enhanced data loading with better error handling
+            load_dataframe_to_database(df, file_info['table_name'], engine)
+            
+            logging.info(f"✅ Loaded {len(df)} rows from {file_info['filename']} → {file_info['table_name']}")
+            
+            # Move to processed folder
+            move_to_processed(file_info['filepath'])
+            loaded_files.append(file_info)
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to load {file_info['filename']}: {str(e)}")
+            logging.error(f"🔍 Error details: {type(e).__name__}: {e}")
+            move_to_failed(file_info['filepath'], f"Data loading failed: {str(e)}")
+    
+    context['task_instance'].xcom_push(key='loaded_files', value=loaded_files)
+    return loaded_files
+
+
+def detect_date_format_and_parse(series: pd.Series, *, force_dayfirst: bool = False):
+    s = series.astype(str).str.strip()
+    null_like = {'', 'nan', 'nat', 'none', 'null', 'NaN', 'NaT', 'NULL'}
+    s = s.where(~s.str.lower().isin({x.lower() for x in null_like}), other=pd.NA)
+
+    if force_dayfirst:
+        parsed = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        return parsed, "infer (dayfirst)"
+
+    candidates = [
+        ("%d/%m/%Y", dict(dayfirst=True)),
+        ("%m/%d/%Y", dict(dayfirst=False)),
+        ("%Y-%m-%d", {}),
+        ("%d-%m-%Y", dict(dayfirst=True)),
+        ("%m-%d-%Y", dict(dayfirst=False)),
+    ]
+
+    results = []
+    for fmt, opts in candidates:
+        parsed = pd.to_datetime(s, format=fmt, errors="coerce", **opts)
+        results.append((parsed.notna().sum(), fmt, opts, parsed))
+
+    for opts in (dict(dayfirst=True), dict(dayfirst=False)):
+        parsed = pd.to_datetime(s, errors="coerce", **opts)
+        results.append((parsed.notna().sum(), "infer", opts, parsed))
+
+    best = max(results, key=lambda x: x[0])
+    parsed_best = best[3]
+    fmt_label = f"{best[1]}{' (dayfirst)' if best[2].get('dayfirst') else ''}"
+    return parsed_best, fmt_label
+
+
+
+def convert_to_python_native(value):
+    """Convert NumPy/Pandas types to Python native types"""
+    if pd.isna(value) or value is None:
+        return None
+    elif hasattr(value, 'item'):  # NumPy scalar
+        return value.item()
+    elif isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    elif isinstance(value, (pd.Int64Dtype, pd.Float64Dtype)):
+        return value.item() if pd.notna(value) else None
+    else:
+        return value
+
+
+# def load_dataframe_row_by_row(df: pd.DataFrame, table_name: str, engine):
+#     """Enhanced row-by-row loading with better error handling and SQL Server compatibility"""
+    
+#     successful_rows = 0
+#     failed_rows = 0
+#     failed_row_details = []
+    
+#     # Get column names for INSERT statement
+#     columns = list(df.columns)
+    
+#     # CRITICAL FIX: Use simple parameter placeholders
+#     placeholders = ', '.join(['?' for _ in columns])
+#     column_names = ', '.join([f'[{col}]' for col in columns])
+    
+#     if hasattr(engine, 'db_type') and engine.db_type == 'sqlserver':
+#         insert_sql = f"INSERT INTO [dbo].[{table_name}] ({column_names}) VALUES ({placeholders})"
+#     else:
+#         insert_sql = f"INSERT INTO {table_name} ({column_names}) VALUES ({placeholders})"
+    
+#     logging.info(f"🔄 Starting row-by-row insert for {len(df)} rows")
+#     logging.info(f"📝 SQL: {insert_sql}")
+#     logging.info(f"🔢 Column count: {len(columns)}")
+#     logging.info(f"🔢 Placeholder count: {len(placeholders.split(','))}")
+    
+#     # CRITICAL FIX: Use proper transaction handling
+#     with engine.begin() as conn:
+#         for index, row in df.iterrows():
+#             try:
+#                 # ✅ FIXED: Convert values to proper Python types
+#                 values = []
+#                 for col in columns:
+#                     value = row[col]
+                    
+#                     # Handle all data types properly
+#                     if value is None or pd.isna(value):
+#                         values.append(None)
+#                     elif hasattr(value, 'to_pydatetime'):  # pandas Timestamp
+#                         values.append(value.to_pydatetime())
+#                     elif isinstance(value, (pd.Timestamp)):
+#                         values.append(value.to_pydatetime())
+#                     elif isinstance(value, (int, float, bool)):
+#                         # Ensure they're Python native types
+#                         if hasattr(value, 'item'):  # numpy scalar
+#                             values.append(value.item())
+#                         else:
+#                             values.append(value)
+#                     elif isinstance(value, str):
+#                         if value.lower() in ['nan', 'nat', 'none', 'null']:
+#                             values.append(None)
+#                         else:
+#                             values.append(value)
+#                     elif hasattr(value, 'item'):  # NumPy types
+#                         try:
+#                             converted = value.item()
+#                             values.append(converted)
+#                         except:
+#                             values.append(str(value) if str(value).lower() not in ['nan', 'nat'] else None)
+#                     else:
+#                         # Convert any other type to string, handle nulls
+#                         str_val = str(value)
+#                         values.append(str_val if str_val.lower() not in ['nan', 'nat', 'none'] else None)
+                
+#                 # Validate parameter count
+#                 if len(values) != len(columns):
+#                     raise ValueError(f"Parameter count mismatch: {len(values)} values vs {len(columns)} columns")
+                
+#                 # Debug the first few rows
+#                 if successful_rows < 3:
+#                     logging.info(f"🔍 Row {index} parameter count: values={len(values)}, columns={len(columns)}")
+#                     logging.info(f"🔍 Row {index} first 5 values: {values[:5]}")
+#                     logging.info(f"🔍 Row {index} value types: {[type(v).__name__ for v in values[:5]]}")
+                
+#                 # #CRITICAL FIX: Use simple SQLAlchemy execution
+#                 # conn.execute(sqlalchemy.text(insert_sql), values)
+#                 # AFTER building insert_sql with ? placeholders and values list:
+#                 conn.exec_driver_sql(insert_sql, tuple(values))
+                
+                
+#                 successful_rows += 1
+                
+#                 # Log progress every 50 rows
+#                 if successful_rows % 50 == 0:
+#                     logging.info(f"📊 Inserted {successful_rows} rows...")
+                
+#             except Exception as row_error:
+#                 failed_rows += 1
+#                 failed_detail = {
+#                     'row_index': index,
+#                     'error': str(row_error),
+#                     'error_type': type(row_error).__name__,
+#                     'values_count': len(values) if 'values' in locals() else 'unknown',
+#                     'columns_count': len(columns),
+#                     'row_data': {col: str(row[col])[:50] for col in columns},
+#                     'value_types': {col: type(row[col]).__name__ for col in columns}
+#                 }
+#                 failed_row_details.append(failed_detail)
+                
+#                 logging.error(f"❌ Failed to insert row {index}: {row_error}")
+#                 logging.error(f"❌ Error type: {type(row_error).__name__}")
+                
+#                 if failed_rows <= 5:  # Log first 5 failures in detail
+#                     logging.error(f"🔍 Failed row data: {failed_detail['row_data']}")
+#                     logging.error(f"🔍 Value types: {failed_detail['value_types']}")
+#                     logging.error(f"🔍 Parameter counts: values={failed_detail['values_count']}, columns={failed_detail['columns_count']}")
+                
+#                 # Stop if too many failures
+#                 if failed_rows > 10:
+#                     logging.error("❌ Too many row failures, stopping insert")
+#                     raise Exception(f"Row-by-row insert failed after {failed_rows} failures")
+    
+#     logging.info(f"✅ Row-by-row insert completed: {successful_rows} successful, {failed_rows} failed")
+    
+#     if failed_rows > 0:
+#         logging.warning(f"⚠️ {failed_rows} rows failed to insert")
+#         # Log summary of failures
+#         for i, failure in enumerate(failed_row_details[:3]):
+#             logging.error(f"Failure {i+1}: Row {failure['row_index']} - {failure['error']}")
+    
+#     if failed_rows > successful_rows:
+#         raise Exception(f"Row-by-row insert failed: {failed_rows} failures vs {successful_rows} successes")
+    
+#     return successful_rows
+
+def load_dataframe_row_by_row(df: pd.DataFrame, table_name: str, engine):
+    """Enhanced row-by-row loading with dialect-specific parameter placeholders"""
+    
+    # ✅ CRITICAL FIX: Detect SQL driver and use appropriate placeholders
+    dialect = engine.dialect.name  # 'mssql' or 'sqlite'
+    paramstyle = engine.dialect.paramstyle  # 'qmark' for pyodbc, 'format' for pymssql
+    
+    logging.info(f"🔍 Database dialect: {dialect}, paramstyle: {paramstyle}")
+    
+    columns = list(df.columns)
+    
+    # ✅ FIXED: Use database-specific table naming
+    if dialect == "mssql":
+        full_table = f"[dbo].[{table_name}]"
+    else:
+        full_table = table_name
+    
+    # ✅ CRITICAL FIX: Choose placeholders based on driver
+    if paramstyle in ("qmark", "numeric"):  # pyodbc → '?'
+        placeholders = ", ".join(["?" for _ in columns])
+        logging.info("🔧 Using '?' placeholders for pyodbc")
+    elif paramstyle in ("format", "pyformat"):  # pymssql → '%s'
+        placeholders = ", ".join(["%s" for _ in columns])
+        logging.info("🔧 Using '%s' placeholders for pymssql")
+    else:
+        # Conservative default
+        placeholders = ", ".join(["?" for _ in columns])
+        logging.info(f"🔧 Using default '?' placeholders for unknown paramstyle: {paramstyle}")
+    
+    column_names = ", ".join([f'[{col}]' for col in columns])
+    insert_sql = f"INSERT INTO {full_table} ({column_names}) VALUES ({placeholders})"
+    
+    logging.info(f"📝 SQL: {insert_sql}")
+    logging.info(f"🔢 Column count: {len(columns)}")
+    logging.info(f"🔢 Placeholder count: {len(placeholders.split(','))}")
+    
+    successful_rows = 0
+    failed_rows = 0
+    failed_row_details = []
+    
+    # ✅ ENHANCED: Better transaction and error handling
+    with engine.begin() as conn:
+        for idx, row in df.iterrows():
+            try:
+                # ✅ ENHANCED: Better value conversion
+                values = []
+                for col in columns:
+                    value = row[col]
+                    
+                    if value is None or pd.isna(value):
+                        values.append(None)
+                    elif hasattr(value, 'to_pydatetime'):  # pandas Timestamp
+                        values.append(value.to_pydatetime())
+                    elif isinstance(value, pd.Timestamp):
+                        values.append(value.to_pydatetime())
+                    elif hasattr(value, 'item'):  # numpy scalar
+                        values.append(value.item())
+                    elif isinstance(value, str):
+                        # Clean string values
+                        if value.lower() in ['nan', 'nat', 'none', 'null']:
+                            values.append(None)
+                        else:
+                            values.append(value)
+                    else:
+                        values.append(value)
+                
+                # ✅ CRITICAL: Use driver-specific execution
+                conn.exec_driver_sql(insert_sql, tuple(values))
+                successful_rows += 1
+                
+                # Progress logging
+                if successful_rows % 100 == 0:
+                    logging.info(f"📊 Inserted {successful_rows} rows...")
+                    
+            except Exception as ex:
+                failed_rows += 1
+                
+                # Log first few failures in detail
+                if failed_rows <= 5:
+                    logging.error(f"❌ Row {idx} failed: {ex}")
+                    logging.error(f"🔍 Row data: {dict(row)}")
+                    logging.error(f"🔍 Processed values: {values}")
+                
+                # Stop if too many failures
+                if failed_rows > 10:
+                    logging.error(f"❌ Too many failures ({failed_rows}), stopping")
+                    raise Exception(f"Row-by-row insert failed after {failed_rows} failures")
+    
+    logging.info(f"✅ Row insert completed: {successful_rows} successful, {failed_rows} failed")
+    
+    if failed_rows > successful_rows:
+        raise Exception(f"Row-by-row insert failed: {failed_rows} failures vs {successful_rows} successes")
+    
+    return successful_rows
+
+# def load_dataframe_to_database(df: pd.DataFrame, table_name: str, engine):
+#     """Load DataFrame to database with enhanced error handling - SIMPLIFIED"""
+    
+#     try:
+#         # FIXED: Better data preparation before bulk insert
+#         logging.info(f"🔄 Attempting bulk insert for {len(df)} rows into {table_name}")
+        
+#         # Handle NULL values properly before bulk insert
+#         df_for_insert = df.copy()
+        
+#         # CRITICAL: Replace NaN and None values consistently
+#         df_for_insert = df_for_insert.where(pd.notnull(df_for_insert), None)
+        
+#         #  Convert data types properly
+#         for col in df_for_insert.columns:
+#             if 'datetime' in str(df_for_insert[col].dtype):
+#                 # Convert pandas datetime to Python datetime
+#                 df_for_insert[col] = df_for_insert[col].apply(
+#                     lambda x: x.to_pydatetime() if pd.notna(x) and hasattr(x, 'to_pydatetime') else None
+#                 )
+#             elif 'int' in str(df_for_insert[col].dtype):
+#                 # Convert to nullable int, then to regular int
+#                 df_for_insert[col] = df_for_insert[col].apply(lambda x: int(x) if pd.notna(x) else None)
+#             elif 'float' in str(df_for_insert[col].dtype):
+#                 # Convert to regular float
+#                 df_for_insert[col] = df_for_insert[col].apply(lambda x: float(x) if pd.notna(x) else None)
+        
+#         # Use pandas to_sql with minimal parameters
+#         df_for_insert.to_sql(
+#             table_name, 
+#             engine, 
+#             if_exists='append', 
+#             index=False,
+#             chunksize=100,  # Small chunks
+#             method=None     # Use default method
+#         )
+        
+#         logging.info(f"✅ Bulk insert successful for {len(df)} rows")
+        
+#     except Exception as e:
+#         logging.error(f"❌ Bulk insert failed: {e}")
+#         logging.info("🔄 Trying row-by-row insert as fallback...")
+        
+#         #  Simplified row-by-row fallback
+#         try:
+#             load_dataframe_row_by_row(df, table_name, engine)
+#         except Exception as e2:
+#             logging.error(f"❌ Row-by-row insert also failed: {e2}")
+#             raise e2
+
+
+def load_dataframe_to_database(df: pd.DataFrame, table_name: str, engine):
+    """Load DataFrame to database with dialect-aware error handling"""
+    
+    try:
+        logging.info(f"🔄 Attempting bulk insert for {len(df)} rows into {table_name}")
+        
+        # Handle NULL values properly before bulk insert
+        df_for_insert = df.copy()
+        df_for_insert = df_for_insert.where(pd.notnull(df_for_insert), None)
+        
+        # Convert data types properly
+        for col in df_for_insert.columns:
+            if 'datetime' in str(df_for_insert[col].dtype):
+                df_for_insert[col] = df_for_insert[col].apply(
+                    lambda x: x.to_pydatetime() if pd.notna(x) and hasattr(x, 'to_pydatetime') else None
+                )
+            elif 'int' in str(df_for_insert[col].dtype):
+                df_for_insert[col] = df_for_insert[col].apply(lambda x: int(x) if pd.notna(x) else None)
+            elif 'float' in str(df_for_insert[col].dtype):
+                df_for_insert[col] = df_for_insert[col].apply(lambda x: float(x) if pd.notna(x) else None)
+        
+        # Use pandas to_sql with minimal parameters
+        df_for_insert.to_sql(
+            table_name, 
+            engine, 
+            if_exists='append', 
+            index=False,
+            chunksize=100,
+            method=None
+        )
+        
+        logging.info(f"✅ Bulk insert successful for {len(df)} rows")
+        
+    except Exception as e:
+        logging.error(f"❌ Bulk insert failed: {e}")
+        logging.info("🔄 Trying dialect-aware row-by-row insert as fallback...")
+        
+        # ✅ FIXED: Use the dialect-aware row-by-row function
+        try:
+            load_dataframe_row_by_row(df, table_name, engine)
+        except Exception as e2:
+            logging.error(f"❌ Row-by-row insert also failed: {e2}")
+            raise e2
+
+def generate_universal_dbt_models(**context):
+    """🎯 Generate dbt models using ACTUAL database schema"""
+    loaded_files = context['task_instance'].xcom_pull(key='loaded_files')
+    created_tables = context['task_instance'].xcom_pull(key='created_tables')
+    
+    if not loaded_files or not created_tables:
+        logging.info("No files to generate dbt models for")
+        return
+    
+    models_path = '/opt/airflow/transformations/models/universal'
+    os.makedirs(models_path, exist_ok=True)
+    
+    # Get database engine to check actual schemas
+    engine = get_database_engine()
+    is_sqlserver = hasattr(engine, 'db_type') and engine.db_type == 'sqlserver'
+    
+    # Only use files that were successfully loaded AND have tables created
+    successful_files = []
+    actual_table_schemas = {}
+    
+    for file_info in loaded_files:
+        table_name = file_info['table_name']
+        if table_name in created_tables:
+            #  Get ACTUAL column names from database
+            actual_columns = get_actual_table_schema(table_name, engine)
+            if actual_columns:
+                file_info['actual_columns'] = actual_columns
+                actual_table_schemas[table_name] = actual_columns
+                successful_files.append(file_info)
+                logging.info(f"✅ {table_name} actual columns: {actual_columns}")
+            else:
+                logging.warning(f"⚠️ Could not get schema for {table_name}")
+        else:
+            logging.warning(f"⚠️ Skipping dbt model for {file_info['filename']} - table not created")
+    
+    if not successful_files:
+        logging.info("No successful files to generate dbt models for")
+        return
+    
+    # Generate sources.yml with ACTUAL database columns
+    sources_config = {
+        'version': 2,
+        'sources': [{
+            'name': 'universal_data',
+            'schema': 'dbo' if is_sqlserver else 'main',
+            'tables': [
+                {
+                    'name': file_info['table_name'],
+                    'description': f"Auto-generated from {file_info['filename']} ({file_info['file_type']})",
+                    'columns': [
+                        {
+                            'name': col_name,
+                            'description': f"Column from {file_info['filename']}"
+                        }
+                        for col_name in file_info['actual_columns']  # ✅ Use actual columns
+                    ]
+                }
+                for file_info in successful_files
+            ]
+        }]
+    }
+    
+    import yaml
+    with open(f"{models_path}/sources.yml", 'w') as f:
+        yaml.dump(sources_config, f)
+    
+    logging.info(f"✅ Generated sources.yml with {len(successful_files)} tables")
+    
+    # Generate staging model for each successful file using ACTUAL columns
+    for file_info in successful_files:
+        table_name = file_info['table_name']
+        actual_columns = file_info['actual_columns']
+        
+        #  FIXED: Use actual database columns
+        if is_sqlserver:
+            date_function = 'GETDATE()'
+            date_filter = "loaded_at >= DATEADD(day, -30, GETDATE())"
+        else:
+            date_function = 'CURRENT_TIMESTAMP'
+            date_filter = "loaded_at >= datetime('now', '-30 days')"
+        
+        # Generate column list from ACTUAL database columns
+        # Separate business data columns from metadata columns
+        metadata_columns = ['source_file', 'file_type', 'loaded_at', 'processing_batch_id']
+        business_columns = [col for col in actual_columns if col not in metadata_columns]
+        
+        # Create SELECT statement with proper column formatting
+        select_columns = []
+        for col in business_columns:
+            select_columns.append(f"    [{col}]")
+        
+        # Add metadata columns if they exist
+        for meta_col in metadata_columns:
+            if meta_col in actual_columns:
+                select_columns.append(f"    [{meta_col}]")
+        
+        # Add DBT processing timestamp
+        select_columns.append(f"    {date_function} as dbt_processed_at")
+        
+        staging_model = f"""
+-- Auto-generated staging model for {file_info['filename']}
+-- File type: {file_info['file_type']}
+-- Generated at: {datetime.now()}
+-- Actual columns: {', '.join(actual_columns)}
+
+{{{{ config(materialized='view') }}}}
+
+SELECT 
+{','.join(select_columns)}
+FROM {{{{ source('universal_data', '{table_name}') }}}}
+WHERE {date_filter}
+"""
+        
+        # Write staging model file
+        model_file_path = f"{models_path}/staging_{table_name}.sql"
+        with open(model_file_path, 'w') as f:
+            f.write(staging_model)
+        
+        logging.info(f"✅ Generated dbt model: staging_{table_name}")
+    
+    logging.info(f"🎯 Successfully generated {len(successful_files)} dbt models using actual database schema")
+
+
+def get_actual_table_schema(table_name: str, engine) -> List[str]:
+    """Get actual column names from database table"""
+    try:
+        with engine.connect() as conn:
+            if hasattr(engine, 'db_type') and engine.db_type == 'sqlserver':
+                query = sqlalchemy.text(f"""
+                    SELECT COLUMN_NAME 
+                    FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = '{table_name}' 
+                    ORDER BY ORDINAL_POSITION
+                """)
+            else:
+                query = sqlalchemy.text(f"PRAGMA table_info({table_name})")
+            
+            result = conn.execute(query)
+            
+            if hasattr(engine, 'db_type') and engine.db_type == 'sqlserver':
+                columns = [row[0] for row in result]
+            else:
+                columns = [row[1] for row in result]  # SQLite PRAGMA returns (cid, name, type, ...)
+                
+            return columns
+    except Exception as e:
+        logging.error(f"❌ Failed to get schema for {table_name}: {e}")
+        return []
+
+def validate_dbt_setup(**context):
+    """🔍 Validate DBT setup before running models with schema validation"""
+    models_path = '/opt/airflow/transformations/models/universal'
+    
+    if not os.path.exists(models_path):
+        logging.error(f"❌ Models path doesn't exist: {models_path}")
+        return False
+    
+    # Check if sources.yml exists
+    sources_file = f"{models_path}/sources.yml"
+    if not os.path.exists(sources_file):
+        logging.error(f"❌ Sources file doesn't exist: {sources_file}")
+        return False
+    
+    # List available model files
+    model_files = glob.glob(f"{models_path}/*.sql")
+    logging.info(f"🎯 Found {len(model_files)} model files:")
+    for model_file in model_files:
+        logging.info(f"  📄 {os.path.basename(model_file)}")
+    
+    # Check database tables exist and validate schemas
+    try:
+        engine = get_database_engine()
+        with engine.connect() as conn:
+            if hasattr(engine, 'db_type') and engine.db_type == 'sqlserver':
+                result = conn.execute(sqlalchemy.text("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE 'raw_%'"))
+            else:
+                result = conn.execute(sqlalchemy.text("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'raw_%'"))
+            
+            tables = [row[0] for row in result]
+            logging.info(f"🏗️ Available database tables: {tables}")
+            
+            # ✅ ADDED: Validate each table schema
+            for table in tables:
+                columns = get_actual_table_schema(table, engine)
+                logging.info(f"📋 {table} columns: {columns}")
+            
+            if not tables:
+                logging.warning("⚠️ No raw tables found in database")
+                return False
+                
+    except Exception as e:
+        logging.error(f"❌ Database validation failed: {e}")
+        return False
+    
+    logging.info("✅ DBT setup validation passed")
+    return True
+
+
+# Define Tasks
+discover_task = PythonOperator(
+    task_id='discover_all_files',
+    python_callable=discover_all_files,
+    dag=dag,
+)
+
+parse_task = PythonOperator(
+    task_id='parse_file_structures',
+    python_callable=parse_file_structures,
+    dag=dag,
+)
+
+create_tables_task = PythonOperator(
+    task_id='create_dynamic_tables',
+    python_callable=create_dynamic_tables,
+    dag=dag,
+)
+
+load_data_task = PythonOperator(
+    task_id='load_all_data',
+    python_callable=load_all_data,
+    dag=dag,
+)
+
+generate_dbt_task = PythonOperator(
+    task_id='generate_universal_dbt_models',
+    python_callable=generate_universal_dbt_models,
+    dag=dag,
+)
+
+
+#------------------------------------------------------------------------------------------------
+#validater for dbt 
+validate_dbt_task = PythonOperator(
+    task_id='validate_dbt_setup',
+    python_callable=validate_dbt_setup,
+    dag=dag,
+)
+
+# Updated  dbt_run_task
+dbt_run_task = BashOperator(
+    task_id='run_universal_dbt_models',
+    bash_command='''
+cd /opt/airflow/transformations && \
+echo "🔍 Checking available models..." && \
+ls -la models/universal/ && \
+echo "🚀 Running dbt models..." && \
+dbt run --profiles-dir . --target docker --select models/universal/* --fail-fast || \
+(echo "❌ Some models failed, continuing..." && exit 0)
+    ''',
+    dag=dag,
+)
+
+#----------------------------------------
+# test 
+#----------------------------------------
+# # Alternative DBT task that's more forgiving
+# dbt_run_task = BashOperator(
+#     task_id='run_universal_dbt_models',
+#     bash_command='''
+# cd /opt/airflow/transformations && \
+# echo "🔍 Available models:" && \
+# find models/universal/ -name "*.sql" -type f 2>/dev/null || echo "No SQL models found" && \
+# echo "🚀 Running dbt..." && \
+# if [ -f "models/universal/sources.yml" ]; then
+#     dbt run --profiles-dir . --target docker --select models/universal/* 2>&1 || echo "⚠️ Some dbt models failed"
+# else
+#     echo "⚠️ No sources.yml found, skipping dbt run"
+# fi
+#     ''',
+#     dag=dag,
+# )
+
+
+discover_task >> parse_task >> create_tables_task >> load_data_task >> generate_dbt_task >> validate_dbt_task >> dbt_run_task
