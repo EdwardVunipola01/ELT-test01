@@ -1,0 +1,56 @@
+name: ELT Pipeline Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-elt-pipeline:
+    name: Check ELT Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install .; fi
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Unit Tests with Pytest
+        run: |
+          pip install pytest
+          pytest tests/
+
+      # Optional: dbt checks
+      - name: Run dbt debug (if using dbt)
+        run: |
+          if command -v dbt >/dev/null 2>&1; then dbt debug; fi
+
+      # Optional: Airflow DAG validation
+      - name: Validate Airflow DAGs (if using Airflow)
+        run: |
+          if [ -d dags ]; then
+            python -m compileall dags/
+          fi
+
+      # Optional: Custom data validation script
+      - name: Run Data Validation Script
+        run: |
+          if [ -f scripts/validate_data.py ]; then
+            python scripts/validate_data.py
+          fi
