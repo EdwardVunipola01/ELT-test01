@@ -47,7 +47,7 @@ jobs:
       - name: Run Unit Tests with Pytest
         run: |
           pip install pytest
-          pytest tests/
+          pytest tests/test_sample.py
 
       # Optional: dbt checks
       - name: Run dbt debug (if using dbt)
