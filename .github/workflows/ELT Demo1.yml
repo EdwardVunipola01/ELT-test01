@@ -81,15 +81,15 @@ jobs:
 
 
       # Optional: Airflow DAG validation
-     #- name: Validate Airflow DAGs (if using Airflow)
-      #  run: |
-      #    if [ -d dags ]; then
-       #     python -m compileall dags/
-       #   fi
+      - name: Validate Airflow DAGs (if using Airflow)
+        run: |
+          if [ -d dags ]; then
+            python -m compileall dags/
+          fi
 
       # Optional: Custom data validation script
-      #- name: Run Data Validation Script
-      #  run: |
-        #  if [ -f scripts/validate_data.py ]; then
-         #   python scripts/validate_data.py
-         # fi
+      - name: Run Data Validation Script
+        run: |
+          if [ -f scripts/validate_data.py ]; then
+            python scripts/validate_data.py
+          fi
