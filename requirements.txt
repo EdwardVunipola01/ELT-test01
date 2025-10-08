@@ -26,7 +26,7 @@ dbt-sqlserver==1.8.2       # For Microsoft SQL Server support
 # ---------------------------------
 psycopg2-binary==2.9.9     # PostgreSQL driver
 pyodbc==5.1.0              # Generic ODBC driver for MsSQL
-mssql-django==1.5.2        # Optional MsSQL backend (if Django is used)
+#mssql-django==1.5.2        # Optional MsSQL backend (if Django is used)
 
 # ---------------------------------
 # Code Quality and Formatting
