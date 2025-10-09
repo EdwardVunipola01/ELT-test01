@@ -59,25 +59,25 @@ jobs:
          # if command -v dbt >/dev/null 2>&1; then dbt debug; fi
       
       # Optional: dbt checks for MS SQL
-      #- name: Run dbt debug (with MS SQL)
-        #run: |
-         # mkdir -p ~/.dbt
-         # cat > ~/.dbt/profiles.yml <<EOL
-         # my_project:
-         #   target: dev
-         #   outputs:
-          #    dev:
-            #    type: sqlserver
-            #    driver: "ODBC Driver 18 for SQL Server"
-            #    server: ${{ secrets.MSSQL_SERVER }}
-            #    port: 1433
-            #    user: ${{ secrets.MSSQL_USER }}
-            #    password: ${{ secrets.MSSQL_PASSWORD }}
-            #    database: ${{ secrets.MSSQL_DB }}
-            #    schema: dbo
-            #    trust_cert: true
-         # EOL
-         # dbt debug
+      - name: Run dbt debug (with MS SQL)
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml <<EOL
+          my_project:
+            target: dev
+            outputs:
+              dev:
+                type: sqlserver
+                driver: "ODBC Driver 18 for SQL Server"
+                server: ${{ secrets.DB_SERVER_SECRET }}
+                port: 1433
+                user: ${{ secrets.DB_USER_SECRET }}
+                password: ${{ secrets.DB_PASSWORD_SECRET }}
+                database: ${{ secrets.DB_NAME_SECRET }}
+                schema: dbo
+                trust_cert: true
+            EOL
+            dbt debug
 
 
       # Optional: Airflow DAG validation
