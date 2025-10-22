@@ -81,11 +81,29 @@ jobs:
 
 
       # Optional: Airflow DAG validation
-      - name: Validate Airflow DAGs (if using Airflow)
+      #- name: Validate Airflow DAGs (if using Airflow)
+      #  run: |
+       #   if [ -d dags ]; then
+        #    python -m compileall dags/
+        #  fi
+
+      - name: Deep Validate Airflow DAGs (Full Airflow Check)
         run: |
           if [ -d dags ]; then
-            python -m compileall dags/
+          echo "🟡 DAGs folder found → Running Airflow DAG validation..."
+          pip install apache-airflow
+          airflow db init
+
+          for dag in $(ls dags/*.py); do
+          echo "🔍 Validating $dag ..."
+          airflow dags validate $(basename $dag .py) || exit 1
+          done
+
+          echo "✅ All DAGs valid and loadable by Airflow."
+          else
+          echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
           fi
+
 
       # Optional: Custom data validation script
       - name: Run Data Validation Script
