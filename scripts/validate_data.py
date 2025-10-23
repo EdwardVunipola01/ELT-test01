@@ -16,15 +16,17 @@ connection_string = (
     f"mssql+pyodbc://{DB_USER}:{DB_PASSWORD}@{DB_SERVER},{DB_PORT}/{DB_NAME}"
     "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
 )
-    
+
 def fail(message):
     """Print error and exit CI pipeline."""
     print(f"❌ VALIDATION FAILED: {message}")
     sys.exit(1)
 
+
 def success(message):
     """Print success message."""
     print(f"✅ {message}")
+
 
 def validate_database_connection(engine):
     """Check if database is online and reachable."""
@@ -34,6 +36,7 @@ def validate_database_connection(engine):
             success("Database connection successful.")
     except Exception as e:
             fail(f"Database connection failed: {e}")
+
 
 def validate_data_freshness(engine, table_name, date_column):
     """Check if table contains recent data."""
@@ -53,6 +56,7 @@ def validate_data_freshness(engine, table_name, date_column):
     
         success(f"{table_name} contains recent data ({last_date}).")
 
+
 def validate_row_count(engine, table_name, min_count=1):
     """Check that the table contains at least min_count rows."""
     query = sa.text(f"SELECT COUNT(*) AS count FROM {table_name}")
@@ -63,6 +67,7 @@ def validate_row_count(engine, table_name, min_count=1):
         fail(f"{table_name} contains too few rows: {count}")
     
         success(f"{table_name} contains {count} rows.")
+
 
 def validate_no_duplicates(engine, table_name, column_name):
     """Check primary key or business key has no duplicates."""
@@ -79,6 +84,7 @@ def validate_no_duplicates(engine, table_name, column_name):
     
         success(f"No duplicates in {column_name} of {table_name}.")
 
+
 def validate_no_nulls(engine, table_name, column_name):
     """Ensure required field is never null."""
     query = sa.text(f"""
@@ -92,6 +98,7 @@ def validate_no_nulls(engine, table_name, column_name):
         fail(f"Null values found in {column_name} of {table_name}.")
     
         success(f"No nulls in {column_name} of {table_name}.")
+
 
 def main():
     engine = sa.create_engine(connection_string)
