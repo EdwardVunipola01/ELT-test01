@@ -16,6 +16,7 @@ connection_string = (
     f"mssql+pyodbc://{DB_USER}:{DB_PASSWORD}@{DB_SERVER},{DB_PORT}/{DB_NAME}"
     "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
 )
+    
     def fail(message):
         """Print error and exit CI pipeline."""
         print(f"❌ VALIDATION FAILED: {message}")
