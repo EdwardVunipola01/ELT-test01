@@ -32,7 +32,7 @@ def validate_database_connection(engine):
         with engine.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
             success("Database connection successful.")
-        except Exception as e:
+    except Exception as e:
             fail(f"Database connection failed: {e}")
 
 def validate_data_freshness(engine, table_name, date_column):
