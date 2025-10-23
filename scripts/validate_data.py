@@ -16,7 +16,6 @@ connection_string = (
     f"mssql+pyodbc://{DB_USER}:{DB_PASSWORD}@{DB_SERVER},{DB_PORT}/{DB_NAME}"
     "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
 )
-
 def fail(message):
     """Print error and exit CI pipeline."""
     print(f"❌ VALIDATION FAILED: {message}")
@@ -77,7 +76,7 @@ def validate_no_duplicates(engine, table_name, column_name):
     if not df.empty:
         fail(f"Duplicate values found in {column_name} of {table_name}")
     
-    success(f"No duplicates in {column_name} of {table_name}.")
+        success(f"No duplicates in {column_name} of {table_name}.")
 
 def validate_no_nulls(engine, table_name, column_name):
     """Ensure required field is never null."""
@@ -91,7 +90,7 @@ def validate_no_nulls(engine, table_name, column_name):
     if df.iloc[0]["nulls"] > 0:
         fail(f"Null values found in {column_name} of {table_name}.")
     
-    success(f"No nulls in {column_name} of {table_name}.")
+        success(f"No nulls in {column_name} of {table_name}.")
 
 def main():
     engine = sa.create_engine(connection_string)
