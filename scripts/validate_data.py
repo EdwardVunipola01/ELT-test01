@@ -50,11 +50,11 @@ def validate_data_freshness(engine, table_name, date_column):
 
     if last_date is None:
         fail(f"No data found in {table_name}.")
-    
+
     # Example: require data within last 48 hours
     if last_date < datetime.now() - timedelta(hours=48):
         fail(f"{table_name} is stale. Last data date: {last_date}")
-    
+
     success(f"{table_name} contains recent data ({last_date}).")
 
 
@@ -66,7 +66,7 @@ def validate_row_count(engine, table_name, min_count=1):
 
     if count < min_count:
         fail(f"{table_name} contains too few rows: {count}")
-    
+
     success(f"{table_name} contains {count} rows.")
 
 
@@ -82,7 +82,7 @@ def validate_no_duplicates(engine, table_name, column_name):
 
     if not df.empty:
         fail(f"Duplicate values found in {column_name} of {table_name}")
-    
+
     success(f"No duplicates in {column_name} of {table_name}.")
 
 
@@ -97,7 +97,7 @@ def validate_no_nulls(engine, table_name, column_name):
 
     if df.iloc[0]["nulls"] > 0:
         fail(f"Null values found in {column_name} of {table_name}.")
-    
+
     success(f"No nulls in {column_name} of {table_name}.")
 
 
@@ -121,6 +121,6 @@ def main():
 
     print("✅ ALL DATA VALIDATION CHECKS PASSED")
     sys.exit(0)
-    
+
     if __name__ == "__main__":
-         main()
+        main()
