@@ -87,6 +87,23 @@ jobs:
         #    python -m compileall dags/
         #  fi
 
+      #- name: Deep Validate Airflow DAGs (Full Airflow Check)
+        #run: |
+          #if [ -d dags ]; then
+          #echo "🟡 DAGs folder found → Running Airflow DAG validation..."
+          #pip install apache-airflow
+         #airflow db init
+
+          #for dag in $(ls dags/*.py); do
+         # echo "🔍 Validating $dag ..."
+         # airflow dags validate $(basename $dag .py) || exit 1
+         # done
+
+          #echo "✅ All DAGs valid and loadable by Airflow."
+          #else
+          #echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
+          #fi
+
       - name: Deep Validate Airflow DAGs (Full Airflow Check)
         run: |
           if [ -d dags ]; then
@@ -94,15 +111,26 @@ jobs:
           pip install apache-airflow
           airflow db init
 
-          for dag in $(ls dags/*.py); do
-          echo "🔍 Validating $dag ..."
-          airflow dags validate $(basename $dag .py) || exit 1
+          for dag_file in dags/*.py; do
+          echo "🔍 Checking file: $dag_file"
+
+          # Extract DAG ID from inside python file
+          DAG_ID=$(grep -oP "(?<=dag_id=['\"])[^'\"]+" "$dag_file" | head -1)
+
+          if [ -z "$DAG_ID" ]; then
+          echo "❌ No dag_id found inside $dag_file"
+          exit 1
+          fi
+
+          echo "➡️ Found DAG ID: $DAG_ID"
+          airflow dags validate "$DAG_ID" || exit 1
           done
 
           echo "✅ All DAGs valid and loadable by Airflow."
           else
           echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
           fi
+
 
 
       # Optional: Custom data validation script
