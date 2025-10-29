@@ -103,34 +103,24 @@ jobs:
           #else
           #echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
           #fi
-
-      - name: Deep Validate Airflow DAGs (Full Airflow Check)
+            
+      - name: Validate Airflow DAGs
         run: |
-          if [ -d dags ]; then
-          echo "🟡 DAGs folder found → Running Airflow DAG validation..."
-          pip install apache-airflow
-          airflow db init
+         echo "🔍 Validating Airflow DAG imports..."
+         python - << 'EOF'
+         from airflow.models import DagBag
 
-          for dag_file in dags/*.py; do
-          echo "🔍 Checking file: $dag_file"
+         dag_bag = DagBag(dag_folder="dags/", include_examples=False)
 
-          # Extract DAG ID from inside python file
-          DAG_ID=$(grep -oP "(?<=dag_id=['\"])[^'\"]+" "$dag_file" | head -1)
-
-          if [ -z "$DAG_ID" ]; then
-          echo "❌ No dag_id found inside $dag_file"
-          exit 1
-          fi
-
-          echo "➡️ Found DAG ID: $DAG_ID"
-          airflow dags validate "$DAG_ID" || exit 1
-          done
-
-          echo "✅ All DAGs valid and loadable by Airflow."
-          else
-          echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
-          fi
-
+         if dag_bag.import_errors:
+          print("❌ DAG import errors found:")
+         for dag_id, error in dag_bag.import_errors.items():
+          print(f"{dag_id} -> {error}")
+         exit(1)
+         else:
+         print("✅ DAGs loaded successfully — no syntax/import errors.")
+         exit(0)
+         EOF
 
 
       # Optional: Custom data validation script
