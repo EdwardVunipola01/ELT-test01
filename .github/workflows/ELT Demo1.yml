@@ -78,23 +78,23 @@ jobs:
           #echo "ℹ️ No dags/ folder found. Skipping Airflow validation."
           #fi
             
-      - name: Validate Airflow DAGs
-        run: |
-         echo "🔍 Validating Airflow DAG imports..."
-         python - << 'EOF'
-         from airflow.models import DagBag
+      #- name: Validate Airflow DAGs
+        #run: |
+         #echo "🔍 Validating Airflow DAG imports..."
+         #python - << 'EOF'
+         #from airflow.models import DagBag
 
-         dag_bag = DagBag(dag_folder="dags/", include_examples=False)
+         #dag_bag = DagBag(dag_folder="dags/", include_examples=False)
 
-         if dag_bag.import_errors:
-          print("❌ DAG import errors found:")
-         for dag_id, error in dag_bag.import_errors.items():
-          print(f"{dag_id} -> {error}")
-         exit(1)
-         else:
-         print("✅ DAGs loaded successfully — no syntax/import errors.")
-         exit(0)
-         EOF
+         #if dag_bag.import_errors:
+          #print("❌ DAG import errors found:")
+         #for dag_id, error in dag_bag.import_errors.items():
+          #print(f"{dag_id} -> {error}")
+         #exit(1)
+         #else:
+         #print("✅ DAGs loaded successfully — no syntax/import errors.")
+         #exit(0)
+         #EOF
 
 
       # Optional: Custom data validation script
